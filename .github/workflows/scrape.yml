@@ -87,6 +87,20 @@ jobs:
 
           python -m main $ARGS
 
+      - name: Price enrichment (real selling price / promos)
+        if: success()
+        run: |
+          STORE="${{ secrets.STORE_KEY }}"
+          # Some stores (Drogasil/Drogaraia) only expose a reference/max price in
+          # the listing; a per-store enricher fetches product pages for the real
+          # selling price. Runs right after the scrape so promos are always fresh.
+          if [ -f "markets/$STORE/enrich_price_$STORE.py" ]; then
+            echo "Running price enrichment for $STORE ..."
+            python -m markets.$STORE.enrich_price_$STORE --workers 30
+          else
+            echo "No price enricher for $STORE — skipping"
+          fi
+
       - name: Prune old price history
         if: success()
         run: python -m db.db_manager prune "${{ secrets.STORE_KEY }}" --days 180
