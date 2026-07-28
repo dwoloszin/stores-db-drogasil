@@ -664,6 +664,34 @@ class StoreDB:
         print(f"  Pruned {deleted:,} price_history rows older than {days} days.")
         return deleted
 
+    def mark_stale_unavailable(self, hours: int = 24) -> int:
+        """
+        Mark as unavailable any offer still flagged available but whose row was
+        NOT refreshed by a scrape in the last `hours`. Scrapers upsert
+        updated_at=NOW() for every product they return, so a stale updated_at
+        means the product dropped out of the catalogue (very likely no longer
+        sold). The 24h default spans several scrape cycles, so a single failed
+        or partial run never wrongly flips products — they only go unavailable
+        after genuinely disappearing for a day. A product that reappears is
+        upserted back to is_available=true automatically.
+        Returns the number of rows flipped.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE offers SET is_available = false "
+                    "WHERE is_available IS TRUE "
+                    "  AND updated_at < NOW() - make_interval(hours => %s)",
+                    (hours,),
+                )
+                flipped = cur.rowcount
+            self._conn.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            self._reconnect()
+            return self.mark_stale_unavailable(hours)
+        print(f"  Marked {flipped:,} stale offers unavailable (not seen in {hours}h).")
+        return flipped
+
     def close(self) -> None:
         self._conn.close()
 
@@ -997,6 +1025,15 @@ if __name__ == "__main__":
     p_prune.add_argument("--days", type=int, default=180,
                          help="Delete history older than N days (default: 180)")
 
+    # mark-stale
+    p_stale = sub.add_parser(
+        "mark-stale",
+        help="Mark offers not seen in the last N hours as unavailable",
+    )
+    p_stale.add_argument("store", choices=list(STORE_REGISTRY) + ["all"])
+    p_stale.add_argument("--hours", type=int, default=24,
+                         help="Flip offers not updated in the last N hours (default: 24)")
+
     args = parser.parse_args()
     load_env(args.env)
 
@@ -1034,6 +1071,17 @@ if __name__ == "__main__":
             try:
                 db = STORE_REGISTRY[store]()
                 db.prune_history(args.days)
+                db.close()
+            except Exception as exc:
+                print(f"[{store}] ERROR: {exc}")
+
+    elif args.cmd == "mark-stale":
+        stores = list(STORE_REGISTRY) if args.store == "all" else [args.store]
+        for store in stores:
+            print(f"[{store}] marking offers not seen in {args.hours}h as unavailable ...")
+            try:
+                db = STORE_REGISTRY[store]()
+                db.mark_stale_unavailable(args.hours)
                 db.close()
             except Exception as exc:
                 print(f"[{store}] ERROR: {exc}")
