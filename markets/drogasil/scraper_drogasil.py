@@ -382,17 +382,17 @@ def scrape(db, limit: Optional[int] = None, workers: int = WORKERS) -> Dict:
     print("Fetching category tree from /categorias ...")
     try:
         all_nodes = fetch_category_tree(session)
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        if status in (403, 429, 500, 502, 503, 504):
-            cached_nodes = _load_category_cache()
-            if cached_nodes:
-                print(f"  WARNING: /categorias returned HTTP {status}. Using cached category tree ({len(cached_nodes)} nodes).")
-                all_nodes = cached_nodes
-            else:
-                print(f"  ERROR: /categorias returned HTTP {status} and no local cache is available.")
-                raise
+    except (requests.exceptions.HTTPError, RuntimeError) as exc:
+        # HTTPError (403/429/5xx) OR the Akamai "Access Denied" RuntimeError raised by
+        # _http_get_with_retry when the datacenter IP is WAF-blocked -> fall back to the
+        # committed category-tree cache so the scrape can still run.
+        cached_nodes = _load_category_cache()
+        if cached_nodes:
+            print(f"  WARNING: /categorias fetch failed ({type(exc).__name__}: {exc}). "
+                  f"Using cached category tree ({len(cached_nodes)} nodes).")
+            all_nodes = cached_nodes
         else:
+            print(f"  ERROR: /categorias fetch failed ({type(exc).__name__}) and no local cache is available.")
             raise
 
     leaves    = [n for n in all_nodes if n["is_leaf"] and n["id"]]
@@ -502,6 +502,14 @@ if __name__ == "__main__":
     print(f"  Upserted: {stats['upserted']:,}  "
           f"history: {stats['history_inserted']:,}  "
           f"skipped: {stats['skipped_zero']:,}")
+
+    # If Akamai blocked the datacenter IP, the cached tree still lets the run proceed
+    # but every product page 403s -> 0 saved. Fail so the workflow's mark-stale step
+    # (if: success) does NOT run and wrongly flip the whole catalogue to unavailable.
+    if stats["upserted"] == 0:
+        db.close()
+        print("ERROR: 0 products scraped (likely Akamai Access Denied on the datacenter IP) — treating as failure.")
+        sys.exit(1)
 
     if args.enrich_ean:
         print("\nFetching EAN from product pages...")
